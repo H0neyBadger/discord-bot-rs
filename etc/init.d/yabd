@@ -1,0 +1,8 @@
+#!/sbin/openrc-run
+
+# for rpi1 alpine: arm-unknown-linux-musleabihf
+# ln -s /etc/init.d/yabd /etc/runlevels/default/
+source /.env
+pidfile="/var/run/${SVCNAME}.pid"
+command="/${SVCNAME}"
+command_background="yes"
