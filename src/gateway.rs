@@ -115,6 +115,33 @@ impl Identify {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+struct ResumeData {
+    token: String,      // Session token
+    session_id: String, // Session ID
+    #[serde(rename = "seq")]
+    sequence: u64, // Last sequence number received
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Resume {
+    op: GatewayOpCode,
+    #[serde(rename = "d")]
+    data: ResumeData,
+}
+
+impl Resume {
+    pub fn new(token: &str, session_id: &str, sequence: u64) -> Self {
+        Self {
+            op: GatewayOpCode::Resume,
+            data: ResumeData {
+                token: String::from(token),
+                session_id: String::from(session_id),
+                sequence: sequence,
+            },
+        }
+    }
+}
+#[derive(Serialize, Deserialize, Debug)]
 pub struct MessageCreateAuthor {
     pub username: String,
 }
@@ -122,6 +149,7 @@ pub struct MessageCreateAuthor {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct MessageCreate {
     pub author: MessageCreateAuthor,
+    pub mentions: Vec<User>,
     pub channel_id: String,
     pub id: String,
     pub content: String,
@@ -129,10 +157,25 @@ pub struct MessageCreate {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+pub struct User {
+    pub id: String,
+    pub username: String,
+    pub bot: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Ready {
+    pub user: User,
+    pub resume_gateway_url: String,
+    pub session_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "t", content = "d")]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EventName {
-    Ready(Value),
+    Ready(Ready),
+    Resumed(Value),
     ChannelCreate(Value),
     // https://discord.com/developers/docs/topics/gateway#gateway-events
     MessageCreate(MessageCreate),

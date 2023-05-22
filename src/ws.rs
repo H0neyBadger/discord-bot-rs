@@ -1,7 +1,8 @@
-use super::bot::Bot;
 use super::gateway::{
     EventName, Gateway, GatewayDispatch, GatewayKind, GatewayOp, GatewayOpCode, Hello, Identify,
+    Resume,
 };
+use super::rest::Rest;
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -48,23 +49,40 @@ impl SocketSequence {
 
 type Socket = Arc<Mutex<SocketSequence>>;
 
-#[derive(Debug)]
-pub struct GatewayConnection {}
+pub struct GatewayConnection<'a> {
+    token: &'a str,
+    resume_gateway_url: Option<String>,
+    session_id: Option<String>,
+    sequence: u64,
+}
 
-impl GatewayConnection {
-    async fn heartbeat(socket: Socket, heartbeat_interval: u64) -> Message {
+impl<'a> GatewayConnection<'a> {
+    async fn heartbeat(socket: Socket, heartbeat_interval: u64) -> Result<(), Error> {
         loop {
             sleep(Duration::from_millis(heartbeat_interval)).await;
             let mut socket = socket.lock().await;
-            println!("Send Hello (heartbeat_interval: {heartbeat_interval})");
+            // println!("Send Hello (heartbeat_interval: {heartbeat_interval})");
             let seq = socket.get_seq();
             let msg = Hello::new(seq);
-            socket.send(msg).await.unwrap();
+            socket.send(msg).await?
         }
     }
 
-    pub async fn run(token: &str, bot: &Bot) {
-        let res = connect_async(Url::parse("wss://gateway.discord.gg/").unwrap()).await;
+    pub fn new(token: &'a str) -> Self {
+        Self {
+            token: token,
+            resume_gateway_url: None,
+            session_id: None,
+            sequence: 0_u64,
+        }
+    }
+
+    pub async fn run(&mut self, id: &str, rest: &Rest) -> Result<(), Error> {
+        let url = self
+            .resume_gateway_url
+            .as_deref()
+            .unwrap_or("wss://gateway.discord.gg/");
+        let res = connect_async(Url::parse(url).unwrap()).await;
         let (socket, response) = match res {
             Ok(values) => values,
             Err(Error::Http(response)) if response.body().is_some() => panic!(
@@ -91,13 +109,21 @@ impl GatewayConnection {
         }
 
         while let Some(msg) = read.next().await {
-            let dispatch: Gateway = match &msg {
-                Ok(Message::Text(txt)) => {
+            let dispatch: Gateway = match &msg? {
+                Message::Text(txt) => {
+                    // println!("Received {}", &txt);
                     serde_json::from_str(txt.as_str()).expect(format!("{:?}", &txt).as_str())
                 }
-                _ => panic!("Received {:?}", msg),
+                // reset bot connection loop
+                Message::Close(_) => return Ok(()),
+                err => panic!("Received {:?}", err),
             };
-            println!("Received {}", json!(dispatch));
+
+            if let Some(sequence) = dispatch.sequence {
+                // save last sequence number
+                self.sequence = sequence;
+            };
+
             let kind = &dispatch.kind;
             match kind {
                 GatewayKind::GatewayOp(GatewayOp {
@@ -109,30 +135,57 @@ impl GatewayConnection {
                     let heartbeat_write = write.clone();
                     tokio::spawn(async move {
                         // send heartbeat loop in background
-                        Self::heartbeat(heartbeat_write, heartbeat_interval).await;
+                        Self::heartbeat(heartbeat_write, heartbeat_interval).await?;
+                        Ok::<(), Error>(())
                     });
                     // auth
-                    write_send!(Identify::new(token))
+                    if self.resume_gateway_url.is_none() {
+                        write_send!(Identify::new(self.token));
+                    } else {
+                        write_send!(Resume::new(
+                            self.token,
+                            self.session_id.as_deref().unwrap(),
+                            self.sequence
+                        ));
+                    }
+                }
+                GatewayKind::GatewayOp(GatewayOp {
+                    op: GatewayOpCode::Reconnect,
+                    ..
+                }) => {
+                    write_send!(Resume::new(
+                        self.token,
+                        self.session_id.as_deref().unwrap(),
+                        self.sequence
+                    ))
                 }
                 GatewayKind::GatewayOp(GatewayOp {
                     op: GatewayOpCode::HeartbackACK,
                     ..
                 }) => {}
                 GatewayKind::Event(GatewayDispatch {
-                    data: EventName::Ready(_),
+                    data: EventName::Ready(data),
                     ..
                 }) => {
-                    println!("Ready");
+                    println!(
+                        "Ready resume_gateway_url {}, session_id {}",
+                        data.resume_gateway_url.as_str(),
+                        data.session_id.as_str()
+                    );
+                    self.resume_gateway_url = Some(data.resume_gateway_url.to_owned());
+                    self.session_id = Some(data.session_id.to_owned());
                 }
                 GatewayKind::Event(GatewayDispatch {
                     data: EventName::MessageCreate(data),
                     ..
                 }) => {
-                    println!("MessageCreated {}", json!(data));
-                    bot.react(data.channel_id.as_str(), data.id.as_str(), "🔥")
-                        .await
-                        .unwrap();
-                    // bot.react(data.channel_id.as_str(), data.id.as_str(), "738480321217167460").await.unwrap();
+                    // println!("MessageCreated {}", json!(data));
+                    if data.mentions.iter().find(|user| user.id == id).is_some() {
+                        // react to mention only
+                        rest.react(data.channel_id.as_str(), data.id.as_str(), "🔥")
+                            .await
+                            .unwrap();
+                    }
                 }
                 GatewayKind::Event(GatewayDispatch { data: event, .. }) => {
                     println!("Event {:?}", event);
@@ -140,5 +193,6 @@ impl GatewayConnection {
                 _ => panic!("Code {:?}", dispatch),
             };
         }
+        Ok(())
     }
 }
